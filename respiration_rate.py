@@ -24,6 +24,12 @@ GRAPH_HEIGHT = 220
 GRAPH_WIDTH = 900
 CHART_MARGIN = 32
 DEFAULT_GRAPH_SPAN_SECONDS = 15.0
+FACE_SIGNAL_WEIGHT = 0.35
+CHEST_SIGNAL_WEIGHT = 0.65
+MIN_SIGNAL_SAMPLES = 10
+
+
+Rect = tuple[int, int, int, int]
 
 
 @dataclasses.dataclass
@@ -102,22 +108,38 @@ def load_face_cascade():
     return cascade
 
 
-def detect_face_rect(frame: np.ndarray, cascade, min_face_size: int):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+def _detect_largest_face(gray: np.ndarray, cascade, min_face_size: int, scale_factor: float, min_neighbors: int):
     faces = cascade.detectMultiScale(
         gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
+        scaleFactor=scale_factor,
+        minNeighbors=min_neighbors,
         minSize=(min_face_size, min_face_size),
     )
-
     if len(faces) == 0:
         return None
-
     return max(faces, key=lambda rect: rect[2] * rect[3])
 
 
-def chest_roi_from_face(face_rect, frame_shape):
+def detect_face_rect(frame: np.ndarray, cascade, min_face_size: int):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    equalized = cv2.equalizeHist(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+    for candidate in (gray, equalized, clahe):
+        rect = _detect_largest_face(candidate, cascade, min_face_size, scale_factor=1.1, min_neighbors=5)
+        if rect is not None:
+            return rect
+
+    # Fallback pass with a slightly more permissive setting for difficult lighting.
+    for candidate in (equalized, clahe):
+        rect = _detect_largest_face(candidate, cascade, min_face_size, scale_factor=1.05, min_neighbors=3)
+        if rect is not None:
+            return rect
+
+    return None
+
+
+def chest_roi_from_face(face_rect: Rect, frame_shape):
     x, y, w, h = face_rect
     chest_x = x - int(w * 0.20)
     chest_y = y + h + int(h * 0.05)
@@ -131,7 +153,21 @@ def chest_roi_from_face(face_rect, frame_shape):
     return chest_x, chest_y, chest_w, chest_h
 
 
-def smooth_rect(previous_rect, current_rect, alpha: float):
+def face_signal_roi_from_face(face_rect: Rect, frame_shape):
+    x, y, w, h = face_rect
+    face_x = x + int(w * 0.20)
+    face_y = y + int(h * 0.20)
+    face_w = int(w * 0.60)
+    face_h = int(h * 0.55)
+
+    face_x = max(0, face_x)
+    face_y = max(0, face_y)
+    face_w = max(1, min(frame_shape[1] - face_x, face_w))
+    face_h = max(1, min(frame_shape[0] - face_y, face_h))
+    return face_x, face_y, face_w, face_h
+
+
+def smooth_rect(previous_rect: Rect | None, current_rect: Rect, alpha: float) -> Rect:
     if previous_rect is None:
         return tuple(int(value) for value in current_rect)
 
@@ -142,7 +178,7 @@ def smooth_rect(previous_rect, current_rect, alpha: float):
     return tuple(int(round(value)) for value in blended)
 
 
-def extract_chest_motion(prev_gray: np.ndarray | None, current_gray: np.ndarray):
+def extract_motion(prev_gray: np.ndarray | None, current_gray: np.ndarray):
     if prev_gray is None:
         return None
 
@@ -167,12 +203,12 @@ def extract_signal(frame: np.ndarray, roi, prev_gray: np.ndarray | None):
     patch = frame[y : y + h, x : x + w]
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-    motion = extract_chest_motion(prev_gray, gray)
+    motion = extract_motion(prev_gray, gray)
     return gray, motion
 
 
-def estimate_bpm(samples: list[Sample], min_hz: float = BREATHING_MIN_HZ, max_hz: float = BREATHING_MAX_HZ):
-    if len(samples) < 10:
+def prepare_uniform_signal(samples: collections.abc.Sequence[Sample]):
+    if len(samples) < MIN_SIGNAL_SAMPLES:
         return None
 
     timestamps = np.array([sample.timestamp for sample in samples], dtype=np.float64)
@@ -193,8 +229,49 @@ def estimate_bpm(samples: list[Sample], min_hz: float = BREATHING_MIN_HZ, max_hz
 
     target_count = max(32, int(math.ceil(duration * sampling_rate)))
     uniform_times = np.linspace(timestamps[0], timestamps[-1], target_count)
-    interpolated = np.interp(uniform_times, timestamps, values)
-    detrended = interpolated - np.mean(interpolated)
+    interpolated_values = np.interp(uniform_times, timestamps, values)
+    return uniform_times, interpolated_values, sampling_rate
+
+
+def normalize_motion(value: float | None, history: collections.deque[float]):
+    if value is None:
+        return None
+    if len(history) < 8:
+        return value
+
+    history_array = np.array(history, dtype=np.float64)
+    mean = float(np.mean(history_array))
+    std = float(np.std(history_array))
+    if std < 1e-6:
+        return value - mean
+    normalized = (value - mean) / std
+    return float(np.clip(normalized, -3.0, 3.0))
+
+
+def fuse_signals(chest_value: float | None, face_value: float | None):
+    available = []
+    if chest_value is not None:
+        available.append((chest_value, CHEST_SIGNAL_WEIGHT))
+    if face_value is not None:
+        available.append((face_value, FACE_SIGNAL_WEIGHT))
+
+    if not available:
+        return None
+
+    weighted_sum = sum(value * weight for value, weight in available)
+    total_weight = sum(weight for _, weight in available)
+    if total_weight <= 0:
+        return None
+    return weighted_sum / total_weight
+
+
+def estimate_bpm(samples: list[Sample], min_hz: float = BREATHING_MIN_HZ, max_hz: float = BREATHING_MAX_HZ):
+    prepared = prepare_uniform_signal(samples)
+    if prepared is None:
+        return None
+
+    _, interpolated_values, sampling_rate = prepared
+    detrended = interpolated_values - np.mean(interpolated_values)
     window = np.hanning(len(detrended))
     spectrum = np.fft.rfft(detrended * window)
     frequencies = np.fft.rfftfreq(len(detrended), d=1.0 / sampling_rate)
@@ -214,29 +291,12 @@ def estimate_bpm(samples: list[Sample], min_hz: float = BREATHING_MIN_HZ, max_hz
 
 
 def bandpass_breathing_component(samples: collections.deque[Sample], min_hz: float = BREATHING_MIN_HZ, max_hz: float = BREATHING_MAX_HZ):
-    if len(samples) < 10:
+    prepared = prepare_uniform_signal(samples)
+    if prepared is None:
         return None
 
-    timestamps = np.array([sample.timestamp for sample in samples], dtype=np.float64)
-    values = np.array([sample.value for sample in samples], dtype=np.float64)
-
-    duration = timestamps[-1] - timestamps[0]
-    if duration <= 0:
-        return None
-
-    sampling_intervals = np.diff(timestamps)
-    positive_intervals = sampling_intervals[sampling_intervals > 0]
-    if len(positive_intervals) == 0:
-        return None
-
-    sampling_rate = 1.0 / float(np.median(positive_intervals))
-    if sampling_rate < 2.0:
-        return None
-
-    target_count = max(32, int(math.ceil(duration * sampling_rate)))
-    uniform_times = np.linspace(timestamps[0], timestamps[-1], target_count)
-    interpolated = np.interp(uniform_times, timestamps, values)
-    centered = interpolated - np.mean(interpolated)
+    uniform_times, interpolated_values, sampling_rate = prepared
+    centered = interpolated_values - np.mean(interpolated_values)
     spectrum = np.fft.rfft(centered)
     frequencies = np.fft.rfftfreq(len(centered), d=1.0 / sampling_rate)
 
@@ -259,13 +319,17 @@ def select_graph_samples(samples: collections.deque[Sample], graph_span_seconds:
     return collections.deque(samples)
 
 
-def draw_overlay(frame: np.ndarray, roi, bpm: float | None, sample_count: int):
-    x, y, w, h = roi
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+def draw_rect(frame: np.ndarray, rect: Rect, color: tuple[int, int, int], thickness: int = 2):
+    x, y, w, h = rect
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
 
-    label = "Respiration: -- bpm"
+
+def draw_overlay(frame: np.ndarray, roi, bpm: float | None, sample_count: int):
+    draw_rect(frame, roi, (0, 255, 0), 2)
+
+    label = "Respiration (face+chest): -- bpm"
     if bpm is not None:
-        label = f"Respiration: {bpm:.1f} bpm"
+        label = f"Respiration (face+chest): {bpm:.1f} bpm"
 
     cv2.putText(
         frame,
@@ -393,13 +457,18 @@ def main() -> int:
     args = parse_args()
     smooth_alpha = min(max(args.smooth_alpha, 0.0), 1.0)
     graph_span_seconds = max(2.0, min(args.window_seconds, DEFAULT_GRAPH_SPAN_SECONDS))
+    max_face_hold_frames = 8
     capture = open_capture(args.source)
     face_cascade = load_face_cascade()
     samples: collections.deque[Sample] = collections.deque()
     last_bpm: float | None = None
     prev_chest_gray: np.ndarray | None = None
+    prev_face_gray: np.ndarray | None = None
+    recent_chest_motion: collections.deque[float] = collections.deque(maxlen=120)
+    recent_face_motion: collections.deque[float] = collections.deque(maxlen=120)
     smoothed_face_rect = None
     smoothed_chest_roi = None
+    face_miss_frames = 0
 
     if args.show:
         try:
@@ -418,29 +487,51 @@ def main() -> int:
 
             timestamp = time.time()
             face_rect = detect_face_rect(frame, face_cascade, args.min_face_size)
+
+            if face_rect is None and smoothed_face_rect is not None and face_miss_frames < max_face_hold_frames:
+                face_rect = smoothed_face_rect
+                face_miss_frames += 1
+            elif face_rect is None:
+                face_miss_frames = 0
+            else:
+                face_miss_frames = 0
+
             if face_rect is not None:
                 smoothed_face_rect = smooth_rect(smoothed_face_rect, face_rect, smooth_alpha)
                 chest_roi = chest_roi_from_face(smoothed_face_rect, frame.shape)
+                face_signal_roi = face_signal_roi_from_face(smoothed_face_rect, frame.shape)
                 smoothed_chest_roi = smooth_rect(smoothed_chest_roi, chest_roi, smooth_alpha)
                 chest_roi = smoothed_chest_roi
-                prev_chest_gray, signal_value = extract_signal(frame, chest_roi, prev_chest_gray)
-                if signal_value is not None:
-                    samples.append(Sample(timestamp=timestamp, value=signal_value))
+
+                prev_chest_gray, chest_motion = extract_signal(frame, chest_roi, prev_chest_gray)
+                prev_face_gray, face_motion = extract_signal(frame, face_signal_roi, prev_face_gray)
+
+                chest_norm = normalize_motion(chest_motion, recent_chest_motion)
+                face_norm = normalize_motion(face_motion, recent_face_motion)
+                fused_signal = fuse_signals(chest_norm, face_norm)
+                if fused_signal is not None:
+                    samples.append(Sample(timestamp=timestamp, value=fused_signal))
+
+                if chest_motion is not None:
+                    recent_chest_motion.append(chest_motion)
+                if face_motion is not None:
+                    recent_face_motion.append(face_motion)
 
                 cutoff = timestamp - args.window_seconds
                 while samples and samples[0].timestamp < cutoff:
                     samples.popleft()
 
-                if len(samples) >= 10:
+                if len(samples) >= MIN_SIGNAL_SAMPLES:
                     last_bpm = estimate_bpm(list(samples))
 
-                cv2.rectangle(frame, (smoothed_face_rect[0], smoothed_face_rect[1]), (smoothed_face_rect[0] + smoothed_face_rect[2], smoothed_face_rect[1] + smoothed_face_rect[3]), (255, 120, 60), 2)
-                cv2.rectangle(frame, (chest_roi[0], chest_roi[1]), (chest_roi[0] + chest_roi[2], chest_roi[1] + chest_roi[3]), (0, 255, 0), 2)
+                draw_rect(frame, smoothed_face_rect, (255, 120, 60), 2)
+                draw_rect(frame, chest_roi, (0, 255, 0), 2)
 
                 if args.show:
                     draw_overlay(frame, chest_roi, last_bpm, len(samples))
             elif args.show:
                 prev_chest_gray = None
+                prev_face_gray = None
                 smoothed_face_rect = None
                 smoothed_chest_roi = None
                 cv2.putText(
