@@ -31,6 +31,22 @@ ROI のブレを少し強めに抑えたい場合は、たとえば次のよう�
 python respiration_rate.py --smooth-alpha 0.12
 ```
 
+## Nix で管理する
+
+このプロジェクトは Nix の開発シェルで依存関係を揃えられます。
+
+```bash
+nix develop
+python respiration_rate.py
+```
+
+`flake` を使わない場合は次でも入れます。
+
+```bash
+nix-shell
+python respiration_rate.py
+```
+
 ## 補足
 
 この実装は実用上の出発点です。照明条件、姿勢、服装、カメラ品質で精度は大きく変わります。必要なら次の段階で、胸部ROIの改善、信号前処理の強化、安定化、GUI化を追加できます。
