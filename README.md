@@ -36,14 +36,7 @@ python respiration_rate.py --smooth-alpha 0.12
 このプロジェクトは Nix の開発シェルで依存関係を揃えられます。
 
 ```bash
-nix develop
-python respiration_rate.py
-```
-
-`flake` を使わない場合は次でも入れます。
-
-```bash
-nix-shell
+nix develop --command $SHELL
 python respiration_rate.py
 ```
 
